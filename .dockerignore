@@ -1,0 +1,9 @@
+.git
+.github
+tests
+demo
+docs
+reports
+*.md
+.env
+__pycache__

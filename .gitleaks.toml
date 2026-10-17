@@ -1,0 +1,12 @@
+# Configuration Gitleaks : règles par défaut + allowlist ciblée
+title = "SecurePipeline - Gitleaks"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Fichiers sans secrets réels (documentation et scripts de démo)"
+paths = [
+  '''(^|/)docs/.*\.md$''',
+  '''(^|/)README\.md$''',
+]

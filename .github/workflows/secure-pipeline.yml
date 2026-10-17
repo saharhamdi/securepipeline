@@ -1,0 +1,201 @@
+name: SecurePipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: securepipeline-app
+  REGISTRY: ghcr.io
+
+jobs:
+  # ---------------------------------------------------------------- 1. Build & Test
+  build-test:
+    name: 1 · Build & Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - run: python -m pytest --cov=app --cov-report=term-missing --cov-fail-under=70
+
+  # ---------------------------------------------------------------- 2. Secrets (Gitleaks)
+  secrets-scan:
+    name: 2 · Secrets (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # historique complet : un secret supprimé plus tard reste détecté
+      - name: Gitleaks
+        run: |
+          mkdir -p reports && chmod 777 reports
+          docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:v8.21.2 detect \
+            --source /repo --config /repo/.gitleaks.toml \
+            --report-format json --report-path /repo/reports/gitleaks.json \
+            --redact --exit-code 0
+      - name: Rapport + gate
+        run: python scripts/report.py gitleaks reports/gitleaks.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-gitleaks
+          path: reports/
+
+  # ---------------------------------------------------------------- 3. SAST (Semgrep)
+  sast:
+    name: 3 · SAST (Semgrep)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install semgrep # à épingler sur une version précise en production
+      - name: Semgrep
+        run: |
+          mkdir -p reports
+          semgrep scan --metrics=off \
+            --config p/python --config p/flask --config p/dockerfile \
+            --config .semgrep/custom-rules.yml \
+            --json --output reports/semgrep.json app Dockerfile
+      - name: Rapport + gate
+        run: python scripts/report.py semgrep reports/semgrep.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-semgrep
+          path: reports/
+
+  # ---------------------------------------------------------------- 4. SCA (pip-audit)
+  sca:
+    name: 4 · Dépendances (SCA)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pip-audit
+      - name: pip-audit
+        run: |
+          mkdir -p reports
+          pip-audit -r requirements.txt -f json -o reports/pip-audit.json || true
+      - name: Rapport + gate
+        run: python scripts/report.py pip-audit reports/pip-audit.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-sca
+          path: reports/
+
+  # ---------------------------------------------------------------- 5. Docker build + Trivy + SBOM/Grype
+  image-scan:
+    name: 5 · Image Docker (Trivy, Syft, Grype)
+    runs-on: ubuntu-latest
+    needs: build-test
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Docker build
+        run: |
+          mkdir -p reports
+          docker build -t "$IMAGE_NAME:${{ github.sha }}" .
+
+      - name: Trivy — vulnérabilités de l'image (rapport)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          scanners: vuln
+          format: json
+          output: reports/trivy-image.json
+          severity: CRITICAL,HIGH
+          exit-code: "0"
+      - name: Trivy — mauvaises configurations du Dockerfile (rapport)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: config
+          scan-ref: .
+          format: json
+          output: reports/trivy-config.json
+          severity: CRITICAL,HIGH
+          exit-code: "0"
+
+      - name: SBOM (Syft, CycloneDX + SPDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: cyclonedx-json
+          output-file: reports/sbom.cdx.json
+          artifact-name: sbom.cdx.json
+      - uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          format: spdx-json
+          output-file: reports/sbom.spdx.json
+          upload-artifact: false
+
+      - name: Grype — analyse du SBOM
+        id: grype
+        uses: anchore/scan-action@v6
+        with:
+          sbom: reports/sbom.cdx.json
+          fail-build: false
+          output-format: json
+      - name: Récupérer le rapport Grype
+        run: cp "${{ steps.grype.outputs.json }}" reports/grype.json
+
+      - name: Rapports explicatifs + gate
+        run: |
+          fail=0
+          python scripts/report.py trivy reports/trivy-image.json || fail=1
+          python scripts/report.py trivy reports/trivy-config.json || fail=1
+          python scripts/report.py grype reports/grype.json || fail=1
+          exit $fail
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: report-image
+          path: reports/
+
+  # ---------------------------------------------------------------- 6. Security Gate
+  security-gate:
+    name: 6 · Security Gate
+    runs-on: ubuntu-latest
+    needs: [build-test, secrets-scan, sast, sca, image-scan]
+    steps:
+      - run: echo "## ✅ Security Gate franchi — tous les contrôles sont passés." >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------- 7. Publication (main uniquement)
+  publish:
+    name: 7 · Publication de l'image
+    runs-on: ubuntu-latest
+    needs: security-gate
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build & push
+        run: |
+          IMAGE="${REGISTRY}/${GITHUB_REPOSITORY,,}/${IMAGE_NAME}"
+          docker build -t "$IMAGE:${{ github.sha }}" -t "$IMAGE:latest" .
+          docker push --all-tags "$IMAGE"

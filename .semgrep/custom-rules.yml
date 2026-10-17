@@ -1,0 +1,26 @@
+rules:
+  - id: securepipeline.flask-debug-true
+    languages: [python]
+    severity: ERROR
+    message: >
+      Le mode debug de Flask expose la console Werkzeug (exécution de code à distance).
+      Ne jamais activer debug=True en dehors du poste développeur.
+    pattern: $APP.run(..., debug=True, ...)
+    metadata:
+      cwe: "CWE-489: Active Debug Code"
+      owasp: "A05:2021 Security Misconfiguration"
+
+  - id: securepipeline.sql-injection-fstring
+    languages: [python]
+    severity: ERROR
+    message: >
+      Requête SQL construite par concaténation ou f-string : risque d'injection SQL.
+      Utiliser des requêtes paramétrées (execute("... WHERE x = ?", (valeur,))).
+    patterns:
+      - pattern-either:
+          - pattern: $CONN.execute(f"...", ...)
+          - pattern: $CONN.execute("..." + $X, ...)
+          - pattern: $CONN.execute("..." % $X, ...)
+    metadata:
+      cwe: "CWE-89: SQL Injection"
+      owasp: "A03:2021 Injection"
