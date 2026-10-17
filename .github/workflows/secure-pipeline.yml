@@ -113,48 +113,45 @@ jobs:
           mkdir -p reports
           docker build -t "$IMAGE_NAME:${{ github.sha }}" .
 
+      # Outils de sécurité exécutés via leurs images Docker officielles :
+      # plus robuste que les actions tierces (pas de tag de version à résoudre).
+      # En production, remplacer :latest par une version épinglée (voire un digest).
       - name: Trivy — vulnérabilités de l'image (rapport)
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          image-ref: ${{ env.IMAGE_NAME }}:${{ github.sha }}
-          scanners: vuln
-          format: json
-          output: reports/trivy-image.json
-          severity: CRITICAL,HIGH
-          exit-code: "0"
-      - name: Trivy — mauvaises configurations du Dockerfile (rapport)
-        uses: aquasecurity/trivy-action@0.28.0
-        with:
-          scan-type: config
-          scan-ref: .
-          format: json
-          output: reports/trivy-config.json
-          severity: CRITICAL,HIGH
-          exit-code: "0"
+        run: |
+          chmod 777 reports
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD/reports:/reports" \
+            ghcr.io/aquasecurity/trivy:latest image \
+            --scanners vuln --severity CRITICAL,HIGH \
+            --format json --output /reports/trivy-image.json --exit-code 0 \
+            "$IMAGE_NAME:${{ github.sha }}"
 
-      - name: SBOM (Syft, CycloneDX + SPDX)
-        uses: anchore/sbom-action@v0
-        with:
-          image: ${{ env.IMAGE_NAME }}:${{ github.sha }}
-          format: cyclonedx-json
-          output-file: reports/sbom.cdx.json
-          artifact-name: sbom.cdx.json
-      - uses: anchore/sbom-action@v0
-        with:
-          image: ${{ env.IMAGE_NAME }}:${{ github.sha }}
-          format: spdx-json
-          output-file: reports/sbom.spdx.json
-          upload-artifact: false
+      - name: Trivy — mauvaises configurations du Dockerfile (rapport)
+        run: |
+          docker run --rm \
+            -v "$PWD:/src:ro" \
+            -v "$PWD/reports:/reports" \
+            ghcr.io/aquasecurity/trivy:latest config \
+            --severity CRITICAL,HIGH \
+            --format json --output /reports/trivy-config.json --exit-code 0 \
+            /src
+
+      - name: SBOM (Syft — CycloneDX + SPDX)
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD/reports:/reports" \
+            anchore/syft:latest "docker:$IMAGE_NAME:${{ github.sha }}" \
+            -o cyclonedx-json=/reports/sbom.cdx.json \
+            -o spdx-json=/reports/sbom.spdx.json
 
       - name: Grype — analyse du SBOM
-        id: grype
-        uses: anchore/scan-action@v6
-        with:
-          sbom: reports/sbom.cdx.json
-          fail-build: false
-          output-format: json
-      - name: Récupérer le rapport Grype
-        run: cp "${{ steps.grype.outputs.json }}" reports/grype.json
+        run: |
+          docker run --rm \
+            -v "$PWD/reports:/reports" \
+            anchore/grype:latest "sbom:/reports/sbom.cdx.json" \
+            -o json --file /reports/grype.json
 
       - name: Rapports explicatifs + gate
         run: |
